@@ -193,49 +193,6 @@ filter LLM response text, either use `gptel-request' with a
 custom callback, or use `gptel-post-response-functions'."
  "0.9.7")
 
-(defcustom gptel-pre-response-hook nil
-  "Hook run before inserting the LLM response into the current buffer.
-
-This hook is called in the buffer where the LLM response will be
-inserted.
-
-Note: this hook only runs if the request succeeds."
-  :type 'hook)
-
-(define-obsolete-variable-alias
-  'gptel-post-response-hook 'gptel-post-response-functions
-  "0.6.0"
-  "Post-response functions are now called with two arguments: the
-start and end buffer positions of the response.")
-
-(defcustom gptel-post-response-functions nil
-  "Abnormal hook run after inserting the LLM response into the current buffer.
-
-This hook is called in the buffer to which the LLM response is
-sent, and after the full response has been inserted.  Each
-function is called with two arguments: the response beginning and
-end positions.
-
-Note: this hook runs even if the request fails.  In this case the
-response beginning and end positions are both the cursor position
-at the time of the request."
-  :type 'hook)
-
-;; (defcustom gptel-pre-stream-insert-hook nil
-;;   "Hook run before each insertion of the LLM's streaming response.
-
-;; This hook is called in the buffer from which the prompt was sent
-;; to the LLM, immediately before text insertion."
-;;   :group 'gptel
-;;   :type 'hook)
-
-(defcustom gptel-post-stream-hook nil
-  "Hook run after each insertion of the LLM's streaming response.
-
-This hook is called in the buffer from which the prompt was sent
-to the LLM, and after a text insertion."
-  :type 'hook)
-
 ;; TODO: Handle `prog-mode' using the `comment-start' variable
 (defcustom gptel-prompt-prefix-alist
   '((markdown-mode . "### ")
@@ -455,6 +412,14 @@ the same as t."
      :context-window 400
      :input-cost 0.05
      :output-cost 0.40
+     :cutoff-date "2024-09")
+    (gpt-5.1
+     :description "The best model for coding and agentic tasks"
+     :capabilities (media tool-use json url)
+     :mime-types ("image/jpeg" "image/png" "image/gif" "image/webp")
+     :context-window 400
+     :input-cost 1.25
+     :output-cost 10
      :cutoff-date "2024-09")
     (o1
      :description "Reasoning model designed to solve hard problems across domains"
@@ -898,6 +863,21 @@ Later plists in the sequence take precedence over earlier ones."
     (insert-file-contents path)
     (goto-char pm))
   (insert "\n```\n"))
+
+(defun gptel--strip-mode-suffix (mode-sym)
+  "Remove the -mode suffix from MODE-SYM.
+
+MODE-SYM is typically a major-mode symbol."
+  (or (alist-get mode-sym gptel--mode-description-alist)
+      (let ((mode-name (thread-last
+                         (symbol-name mode-sym)
+                         (string-remove-suffix "-mode")
+                         (string-remove-suffix "-ts"))))
+        ;; NOTE: The advertised calling convention of provided-mode-derived-p
+        ;; has changed in Emacs 30, this needs to be updated eventually
+        (if (provided-mode-derived-p
+             mode-sym 'prog-mode 'text-mode 'tex-mode)
+            mode-name ""))))
 
 (defvar url-http-end-of-headers)
 (defvar url-http-response-status)
@@ -1595,7 +1575,10 @@ considered a success and acts as a default.")
 
 (defvar gptel-request--handlers
   `((WAIT ,#'gptel--handle-wait)
-    (TOOL ,#'gptel--handle-tool-use))
+    (TOOL ,#'gptel--handle-tool-use)
+    (DONE ,#'gptel--handle-post)
+    (ERRS ,#'gptel--handle-post)
+    (ABRT ,#'gptel--handle-post))
   "Alist specifying handlers for gptel's default state transitions.
 
 Each entry is a list whose car is a request state (a symbol) and
@@ -1754,6 +1737,12 @@ MACHINE is an instance of `gptel-fsm'"
           (plist-put info :tool-pending t)
           (funcall (plist-get info :callback)
                    (cons 'tool-call pending-calls) info))))))
+
+(defun gptel--handle-post (fsm)
+  "Run cleanup for `gptel-request' with FSM."
+  (when-let* ((info (gptel-fsm-info fsm))
+              (post (plist-get info :post)))
+    (mapc (lambda (f) (funcall f info)) post)))
 
 ;;;; State machine predicates
 ;; Predicates used to find the next state to transition to, see
@@ -1976,11 +1965,16 @@ be used to rerun or continue the request at a later time."
               ;; TEMP Decide on the annoated prompt-list format
               (gptel--parse-list-and-insert prompt)
               (current-buffer)))))
+         (system-list (gptel--parse-directive system 'raw)) ;eval function-valued system prompts
          (info (list :data prompt-buffer
                      :buffer buffer
                      :position start-marker)))
     (when transforms (plist-put info :transforms transforms))
-    (with-current-buffer prompt-buffer (setq gptel--system-message system))
+    (with-current-buffer prompt-buffer
+      (setq gptel--system-message       ;guaranteed to be buffer-local
+            ;; Retain single-part system messages as strings to avoid surprises
+            ;; when applying presets
+            (if (cdr system-list) system-list (car system-list))))
     (when stream (plist-put info :stream stream))
     ;; This context should not be confused with the context aggregation context!
     (when callback (plist-put info :callback callback))
@@ -2050,9 +2044,6 @@ Initiate the request when done."
              ;; TODO(tool) Limit tool use to capable models after documenting :capabilities
              ;; (gptel-use-tools (and (gptel--model-capable-p 'tool-use) gptel-use-tools))
              (stream (and (plist-get info :stream) gptel-use-curl gptel-stream
-                          ;; HACK(tool): no stream if Ollama + tools.  Need to find a better way
-                          (not (and (eq (type-of gptel-backend) 'gptel-ollama)
-                                    gptel-tools gptel-use-tools))
                           ;; Check model-specific request-params for streaming preference
                           (let* ((model-params (gptel--model-request-params gptel-model))
                                  (stream-spec (plist-get model-params :stream)))
@@ -2076,8 +2067,7 @@ Initiate the request when done."
         ;; irrespective of the preference in `gptel-use-context'.  This is
         ;; because media cannot be included (in general) with system messages.
         ;; TODO(augment): Find a way to do this in the prompt-buffer?
-        (when (and gptel-context gptel-use-context
-                   gptel-track-media (gptel--model-capable-p 'media))
+        (when (and gptel-context gptel-use-context (gptel--model-capable-p 'media))
           (gptel--inject-media gptel-backend full-prompt))
         (unless stream (cl-remf info :stream))
         (plist-put info :backend gptel-backend)
@@ -2529,17 +2519,14 @@ INFO contains the request data, TOKEN is a unique identifier."
      (list (format "-w(%s . %%{size_header})" token))
      (if (length< data-json gptel-curl-file-size-threshold)
          (list (format "-d%s" data-json))
-       (letrec
-           ((write-region-inhibit-fsync t)
-            (file-name-handler-alist nil)
-            (temp-filename (make-temp-file "gptel-curl-data" nil ".json" data-json))
-            (cleanup-fn (lambda (&rest _)
-                          (when (file-exists-p temp-filename)
-                            (delete-file temp-filename)
-                            (remove-hook 'gptel-post-response-functions cleanup-fn)))))
-         (add-hook 'gptel-post-response-functions cleanup-fn)
-         (list "--data-binary"
-               (format "@%s" temp-filename))))
+       (let* ((write-region-inhibit-fsync t)
+              (file-name-handler-alist nil)
+              (inhibit-message t)
+              (temp-filename (make-temp-file "gptel-curl-data" nil ".json" data-json))
+              (cleanup-fn (lambda (&rest _) (when (file-exists-p temp-filename)
+                                         (delete-file temp-filename)))))
+         (plist-put info :post (cons cleanup-fn (plist-get info :post)))
+         (list "--data-binary" (format "@%s" temp-filename))))
      (when (not (string-empty-p gptel-proxy))
        (list "--proxy" gptel-proxy
              "--proxy-negotiate"
@@ -2752,7 +2739,8 @@ PROCESS and _STATUS are process parameters."
                   (unless reasoning-block ;Record that we're in a reasoning block (#709)
                     (plist-put proc-info :reasoning-block 'in))
                   (plist-put proc-info :reasoning nil)) ;Reset for next parsing round
-                 ((string-blank-p response)) ;Defer checking if response is blank
+                 ((and (string-blank-p response) ;Defer checking if response is blank
+                       (not reasoning-block))) ;unless we're in a reasoning block already
                  ((and (null reasoning-block) (length> response 0))
                   ;; Obtained from main response stream: reasoning block start
                   (if-let*  ((idx (string-match-p "<think>" response)))
