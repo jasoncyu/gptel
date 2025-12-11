@@ -134,6 +134,9 @@ list."
       (when gptel-tools
         (plist-put prompts-plist :tools
                    (gptel--parse-tools backend gptel-tools))))
+    ;; hard-code for now I think I always want this
+    (plist-put prompts-plist :tools
+               [(:google_search ())])
     (when gptel-temperature
       (setq params
             (plist-put params
