@@ -1,6 +1,6 @@
 ;;; gptel-context.el --- Context aggregator for gptel  -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2023-2025  Karthik Chikmagalur
+;; Copyright (C) 2023-2026  Karthik Chikmagalur
 
 ;; Author: daedsidog <contact@daedsidog.com>
 ;; Keywords: convenience, buffers
@@ -409,20 +409,20 @@ This modifies the buffer."
       ('system
        (if (gptel--model-capable-p 'nosystem)
            (gptel-context--wrap-in-buffer context-string 'user)
-         (if gptel--system-message
-             (cl-etypecase gptel--system-message
+         (if gptel-system-prompt
+             (cl-etypecase gptel-system-prompt
                (string
-                (setq gptel--system-message
-                      (concat context-string "\n\n" gptel--system-message)))
+                (setq gptel-system-prompt
+                      (concat context-string "\n\n" gptel-system-prompt)))
                (function
-                (setq gptel--system-message
-                      (gptel--parse-directive gptel--system-message 'raw))
+                (setq gptel-system-prompt
+                      (gptel--parse-directive gptel-system-prompt 'raw))
                 (gptel-context--wrap-in-buffer context-string))
                (list
-                (setq gptel--system-message ;cons a new list to avoid mutation
-                      (cons (concat context-string "\n\n" (car gptel--system-message))
-                            (cdr gptel--system-message)))))
-           (setq gptel--system-message context-string))))
+                (setq gptel-system-prompt ;cons a new list to avoid mutation
+                      (cons (concat context-string "\n\n" (car gptel-system-prompt))
+                            (cdr gptel-system-prompt)))))
+           (setq gptel-system-prompt context-string))))
       ('user
        (goto-char (point-max))
        (text-property-search-backward 'gptel nil t)
@@ -516,24 +516,20 @@ Ignore overlays, buffers and files that are not live or readable."
 
 CONTEXT-DATA is a plist with keys :overlays, :lines and :bounds.
 Returns a sorted list of (START . END) position pairs."
-  (let (regions)
+  (let ((regions                   ; Collect bounds (already in position format)
+         (when-let* ((bounds (plist-get context-data :bounds)))
+           (if (consp (car bounds)) bounds (list bounds)))))
     (with-current-buffer buffer
       (without-restriction
         ;; Collect overlays
         (dolist (ov (plist-get context-data :overlays))
           (when (overlay-start ov)
             (push (cons (overlay-start ov) (overlay-end ov))
-                  regions)))
-        ;; Collect bounds (already in position format)
-        (when-let* ((bounds (plist-get context-data :bounds)))
-          (if (consp (car bounds))
-              (setq regions (nconc regions bounds)) ;((start1 . end1) (start2 . end2) ...)
-            (push bounds regions)))                 ;(start1 . end1)
+                  regions)))                 ;(start1 . end1)
         ;; Collect lines (convert line numbers to positions)
         (when-let* ((line-bounds (plist-get context-data :lines)))
-          ;; Convert singleton (start1 . end1) to ((start1 . end1))
-          (unless (consp (car line-bounds)) (setq line-bounds (list line-bounds)))
-          (dolist (pair line-bounds)
+          (dolist (pair (if (consp (car line-bounds)) ;Handle single (BEG . END)
+                            line-bounds (list line-bounds)))
             (push (cons (progn (goto-char (point-min))
                                (forward-line (1- (car pair)))
                                (point))
@@ -543,7 +539,8 @@ Returns a sorted list of (START . END) position pairs."
                   regions)))))
     ;; TODO: Update sort for Emacs 28+ calling convention
     ;; Sort by start position.
-    (sort regions (lambda (a b) (< (car a) (car b))))))
+    ;; NOTE: This can modify `:bounds' of `context-data' by side-effect!
+    (sort regions #'car-less-than-car)))
 
 (defun gptel-context--insert-buffer-string (buffer context-data &optional header)
   "Insert at point a context string from CONTEXT-DATA in BUFFER.
